@@ -33,6 +33,12 @@ func (w *Writer) GetTransferSyntax() (binary.ByteOrder, bool) {
 	return w.bo, w.implicit
 }
 
+// Write implements io.Writer by forwarding the provided bytes directly to the
+// underlying io.Writer without any byte-order transformation.
+func (w *Writer) Write(p []byte) (int, error) {
+	return w.out.Write(p)
+}
+
 // WriteZeros writes len bytes of zeros at the current position of the Writer.
 func (w *Writer) WriteZeros(len int) error {
 	zeros := make([]byte, len)

@@ -231,3 +231,9 @@ func (r *Reader) Peek(n int) ([]byte, error) {
 func (r *Reader) ByteOrder() binary.ByteOrder {
 	return r.bo
 }
+
+// BytesRead returns the total number of bytes read from the underlying input
+// relative to the start of the underlying input (ignoring any limits).
+func (r *Reader) BytesRead() int64 {
+	return r.bytesRead
+}
