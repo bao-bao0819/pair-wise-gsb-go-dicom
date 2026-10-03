@@ -164,7 +164,9 @@ func (r *Reader) Skip(n int64) error {
 // PushLimit creates a limit n bytes from the current position.
 func (r *Reader) PushLimit(n int64) error {
 	newLimit := r.bytesRead + n
-	if newLimit > r.limit && r.limit != LimitReadUntilEOF {
+	// LimitReadUntilEOF means there is no concrete enclosing limit, so any
+	// newly pushed absolute limit is valid.
+	if r.limit != LimitReadUntilEOF && newLimit > r.limit {
 		return fmt.Errorf("new limit exceeds current limit of buffer, new limit: %d, limit: %d", newLimit, r.limit)
 	}
 
@@ -190,6 +192,13 @@ func (r *Reader) PopLimit() {
 func (r *Reader) IsLimitExhausted() bool {
 	// if limit < 0 than we should read until EOF
 	return (r.BytesLeftUntilLimit() <= 0 && r.limit != LimitReadUntilEOF)
+}
+
+// BytesRead returns the total number of bytes read from the underlying input
+// since this Reader was created, regardless of any active limits. This is
+// useful to report the absolute offset of a problem in the original input.
+func (r *Reader) BytesRead() int64 {
+	return r.bytesRead
 }
 
 func (r *Reader) SetTransferSyntax(bo binary.ByteOrder, implicit bool) {
