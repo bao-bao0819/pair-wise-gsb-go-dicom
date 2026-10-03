@@ -37,6 +37,40 @@ fmt.Println(dataset)
 j, _ := json.Marshal(dataset)
 fmt.Println(j)
 ```
+
+### Editing with paths
+`Dataset.ApplyEdits` applies an ordered batch of transactional edits addressed by a path made of tags and sequence item indices. Tags are only matched at the current level (never recursively), so deeply nested or repeated tags never collide. If any edit fails (path missing or ambiguous, item index out of range, or VR/value-type mismatch), the whole batch fails and the original `Dataset` (including nested slices) is left unchanged:
+```go
+newDS, err := dataset.ApplyEdits([]dicom.Edit{
+    // Replace a value inside the first item of a sequence.
+    {
+        Type: dicom.ReplaceValue,
+        Path: []dicom.PathStep{
+            dicom.TagStep{Tag: tag.ContributingEquipmentSequence},
+            dicom.ItemStep{Index: 0},
+            dicom.TagStep{Tag: tag.PatientName},
+        },
+        Value: func() dicom.Value { v, _ := dicom.NewValue([]string{"New^Name"}); return v }(),
+    },
+    // Insert a new item into that sequence (ItemIndex == len appends).
+    {
+        Type: dicom.InsertSequenceItem,
+        Path: []dicom.PathStep{
+            dicom.TagStep{Tag: tag.ContributingEquipmentSequence},
+        },
+        ItemIndex: 1,
+        Item: []*dicom.Element{newElement},
+    },
+    // Delete an element, or an entire item if the path ends in an ItemStep.
+    {
+        Type: dicom.DeleteElement,
+        Path: []dicom.PathStep{
+            dicom.TagStep{Tag: tag.AnatomicRegionSequence},
+            dicom.ItemStep{Index: 1}, // deletes sequence item 1
+        },
+    },
+})
+```
 More details about the package (and additional examples and APIs) can be found in the [godoc](https://godoc.org/github.com/suyashkumar/dicom).
 
 ## CLI Tool
