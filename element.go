@@ -18,7 +18,13 @@ var ErrorUnexpectedDataType = errors.New("the type of the data was unexpected or
 // https://dicom.nema.org/medical/dicom/current/output/html/part05.html#sect_7.1 ).
 // This Element can be serialized to JSON out of the box and pretty printed as a string via the String() method.
 type Element struct {
-	Tag                    tag.Tag    `json:"tag"`
+	Tag tag.Tag `json:"tag"`
+	// Name is an optional identifier for elements that are not part of the
+	// built-in standard dictionary but were resolved through a caller-supplied
+	// private dictionary. It is empty for unknown private elements, which are
+	// intentionally not assigned a fabricated name. It never influences the
+	// on-wire tag.
+	Name                   string     `json:"name,omitempty"`
 	ValueRepresentation    tag.VRKind `json:"VR"`
 	RawValueRepresentation string     `json:"rawVR"`
 	ValueLength            uint32     `json:"valueLength"`
@@ -45,7 +51,9 @@ func (e *Element) Equals(target *Element) bool {
 
 func (e *Element) String() string {
 	var tagName string
-	if tagInfo, err := tag.Find(e.Tag); err == nil {
+	if e.Name != "" {
+		tagName = e.Name
+	} else if tagInfo, err := tag.Find(e.Tag); err == nil {
 		tagName = tagInfo.Keyword
 	}
 	return fmt.Sprintf("[\n  Tag: %s\n  Tag Name: %s\n  VR: %s\n  VR Raw: %s\n  VL: %d\n  Value: %s\n]\n\n",

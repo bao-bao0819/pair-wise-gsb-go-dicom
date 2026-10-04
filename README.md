@@ -39,6 +39,18 @@ fmt.Println(j)
 ```
 More details about the package (and additional examples and APIs) can be found in the [godoc](https://godoc.org/github.com/suyashkumar/dicom).
 
+### Private Tags
+The same private tag number can identify a different field in files produced by different vendors, so a raw tag is not enough to interpret private data. Supply a private dictionary keyed by the Private Creator string, the containing odd group, and the element's intra-block offset:
+
+```go
+dict := dicom.NewPrivateDictionary()
+dict.Add("ACME_INSTRUMENTS", 0x0009, 0x01, "US", "AcmeDose") // (0009,1001)
+
+dataset, _ := dicom.ParseFile("private.dcm", nil, dicom.WithPrivateDictionary(dict))
+```
+
+Each dataset and sequence item maintains its own Private Creator slots; nested items never inherit the enclosing item's bindings, and the same slot can be bound to a different creator in different items. Under Implicit VR the dictionary VR selects the interpretation. Under Explicit VR the on-wire VR is authoritative; use `dicom.PrivateVRConflictHandler` to observe disagreements with the dictionary, or `dicom.RejectPrivateVRConflicts` to fail parsing instead. Elements whose creator is unknown or absent from the dictionary are retained as raw bytes (`UN`) without a fabricated name or type. The dictionary affects interpretation only and never renumbers the tags in the file, so writing a parsed dataset back preserves the original private tags.
+
 ## CLI Tool
 A CLI tool that uses this package to parse imagery and metadata out of DICOMs is provided in the `cmd/dicomutil` package. This tool can take in a DICOM, and dump out all the elements to STDOUT, in addition to writing out any imagery to the current working directory either as PNGs or JPEG (note, it does not perform any automatic color rescaling by default).
 

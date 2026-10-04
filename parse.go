@@ -224,6 +224,7 @@ func canReadElementFromBytes(buf []byte, optSet parseOptSet, bo binary.ByteOrder
 		rawReader: dicomio.NewReader(bufio.NewReader(next100Reader), bo, int64(len(buf))),
 		opts:      optSet,
 	}
+	subR.private = newPrivateScope()
 	subR.rawReader.SetTransferSyntax(bo, implicit)
 	_, err := subR.readElement(nil, nil)
 	if err == nil {
@@ -284,6 +285,9 @@ type parseOptSet struct {
 	skipProcessingPixelDataValue       bool
 	allowMissingMetaElementGroupLength bool
 	allowUnknownSpecificCharacterSet   bool
+	privateDictionary                  *PrivateDictionary
+	rejectPrivateVRConflict            bool
+	privateVRConflictHandler           func(PrivateVRConflict)
 }
 
 func toParseOptSet(opts ...ParseOption) parseOptSet {
@@ -316,6 +320,48 @@ func AllowMissingMetaElementGroupLength() ParseOption {
 func AllowUnknownSpecificCharacterSet() ParseOption {
 	return func(set *parseOptSet) {
 		set.allowUnknownSpecificCharacterSet = true
+	}
+}
+
+// WithPrivateDictionary supplies a caller-defined dictionary of private data
+// elements. The dictionary keys on the resolved Private Creator string, the
+// containing odd group, and the element's intra-block offset, so the same
+// private tag number can map to different fields for different vendors.
+//
+// Under an Implicit VR transfer syntax the dictionary VR is used to interpret
+// matching private elements. Under an Explicit VR transfer syntax the on-wire
+// VR is authoritative by default; if it disagrees with the dictionary a
+// PrivateVRConflict is reported (see PrivateVRConflictHandler and
+// RejectPrivateVRConflicts). Private elements whose creator is unknown, or
+// whose creator is known but the element is absent from the dictionary, are
+// retained as raw bytes and are never assigned a fabricated name or type.
+//
+// The dictionary affects interpretation only; it never reassigns private tag
+// numbers in the underlying file.
+func WithPrivateDictionary(d *PrivateDictionary) ParseOption {
+	return func(set *parseOptSet) {
+		set.privateDictionary = d
+	}
+}
+
+// RejectPrivateVRConflicts causes parsing to fail with the PrivateVRConflict
+// error when an Explicit VR element's on-wire VR disagrees with the VR
+// configured in the supplied private dictionary. By default such conflicts are
+// retained using the on-wire VR and merely reported as diagnostics.
+func RejectPrivateVRConflicts() ParseOption {
+	return func(set *parseOptSet) {
+		set.rejectPrivateVRConflict = true
+	}
+}
+
+// PrivateVRConflictHandler registers a callback invoked whenever an Explicit
+// VR private element's on-wire VR disagrees with the dictionary VR. The
+// callback is diagnostic and does not change parsing: the on-wire VR is kept
+// unless RejectPrivateVRConflicts is also set, in which case parsing fails
+// before the callback's enclosing parse returns.
+func PrivateVRConflictHandler(handler func(PrivateVRConflict)) ParseOption {
+	return func(set *parseOptSet) {
+		set.privateVRConflictHandler = handler
 	}
 }
 

@@ -44,6 +44,100 @@ var (
 type reader struct {
 	rawReader *dicomio.Reader
 	opts      parseOptSet
+	// private is the Private Creator scope for the dataset or sequence item
+	// currently being read. It is swapped for a fresh scope whenever a new
+	// sequence item begins, so child items never inherit parent bindings.
+	private *privateScope
+}
+
+// privateScopeOrNew returns the active Private Creator scope, lazily creating
+// the root dataset scope on first use.
+func (r *reader) privateScopeOrNew() *privateScope {
+	if r.private == nil {
+		r.private = newPrivateScope()
+	}
+	return r.private
+}
+
+// resolvePrivateVR determines the VR and optional dictionary name for private
+// elements, honoring the caller-supplied private dictionary and the current
+// dataset/item Private Creator scope. Non-private tags are left untouched.
+//
+// Under Implicit VR the dictionary selects the VR; under Explicit VR the
+// on-wire VR wins unless conflict rejection is configured. Private elements
+// with no bound creator, or no dictionary entry, are held as opaque UN bytes
+// rather than being assigned a fabricated name or value type.
+func (r *reader) resolvePrivateVR(t tag.Tag, wireVR string, implicit bool) (vr string, name string, err error) {
+	// Private Creator Data Elements are always VR=LO (PS3.5 7.8.1). Under an
+	// Implicit transfer syntax there is no VR on the wire, so select LO from
+	// the element's reserved position. Under an Explicit transfer syntax only
+	// treat it as a creator when the file actually encodes VR=LO, leaving
+	// non-conformant data reusing a reserved low element number untouched.
+	if isPrivateCreatorElement(t) && (implicit || wireVR == vrraw.LongString) {
+		return vrraw.LongString, "", nil
+	}
+	if !isPrivateDataElement(t) {
+		return wireVR, "", nil
+	}
+
+	scope := r.privateScopeOrNew()
+	creator, key, bound := scope.resolve(t)
+	if !bound {
+		// Unknown creator: hold the value as opaque bytes. We do not trust an
+		// on-wire typed VR enough to fabricate a field name or value type,
+		// since the same tag number can mean different things for different
+		// (possibly absent) creators.
+		return vrraw.Unknown, "", nil
+	}
+
+	entry, found := r.opts.privateDictionary.lookup(key)
+	if !found {
+		// Known creator but the field is absent from the dictionary: likewise
+		// retain it as opaque bytes rather than guessing a type.
+		return vrraw.Unknown, "", nil
+	}
+
+	if implicit {
+		// No VR on the wire, so the configured dictionary is authoritative.
+		return entry.VR, entry.Name, nil
+	}
+
+	// Explicit VR: the wire format is authoritative by default, but a
+	// disagreement with the dictionary is surfaced as a diagnostic.
+	if wireVR != entry.VR {
+		conflict := PrivateVRConflict{
+			Tag:          t,
+			Creator:      creator,
+			WireVR:       wireVR,
+			DictionaryVR: entry.VR,
+		}
+		if r.opts.privateVRConflictHandler != nil {
+			r.opts.privateVRConflictHandler(conflict)
+		}
+		debug.Logf("private VR conflict for %s: wire=%s dictionary=%s", t.String(), wireVR, entry.VR)
+		if r.opts.rejectPrivateVRConflict {
+			return "", "", conflict
+		}
+		return wireVR, "", nil
+	}
+	return entry.VR, entry.Name, nil
+}
+
+// bindPrivateCreator records the creator string carried by a Private Creator
+// Data Element into the active scope. It only binds elements that were parsed
+// as VR=LO at a reserved creator position, so non-conformant Explicit data
+// reusing a low element number with a different VR is never treated as a
+// creator. The creator value is normalized so that trailing padding does not
+// affect later dictionary lookups.
+func (r *reader) bindPrivateCreator(t tag.Tag, resolvedVR string, value Value) {
+	if resolvedVR != vrraw.LongString || !isPrivateCreatorElement(t) {
+		return
+	}
+	strs, ok := value.GetValue().([]string)
+	if !ok || len(strs) == 0 {
+		return
+	}
+	r.privateScopeOrNew().bind(t, strs[0])
 }
 
 func (r *reader) readTag() (*tag.Tag, error) {
@@ -639,6 +733,13 @@ func (r *reader) readSequenceItem(t tag.Tag, vr string, vl uint32, d *Dataset) (
 	// TODO: deduplicate with sequenceItem above
 	seqElements := Dataset{}
 
+	// Each sequence item maintains its own Private Creator scope; it does not
+	// inherit the enclosing dataset/item's bindings. Restore the parent scope
+	// once this item has been read.
+	parentScope := r.private
+	r.private = newPrivateScope()
+	defer func() { r.private = parentScope }()
+
 	if vl == tag.VLUndefinedLength {
 		for {
 			subElem, err := r.readElement(&seqElements, nil)
@@ -850,18 +951,31 @@ func (r *reader) readElement(d *Dataset, fc chan<- *frame.Frame) (*Element, erro
 	}
 	debug.Logf("readElement: vr: %s", vr)
 
-	vl, err := r.readVL(readImplicit, *t, vr)
+	wireVR := vr
+	var privateName string
+	resolvedVR, privateName, err := r.resolvePrivateVR(*t, vr, readImplicit)
+	if err != nil {
+		return nil, fmt.Errorf("readElement: error resolving private VR for element %v: %w", t, err)
+	}
+
+	// The VL header width in Explicit VR depends on the on-wire VR, not the
+	// VR we resolved for interpretation, so parse the VL before swapping.
+	vl, err := r.readVL(readImplicit, *t, wireVR)
 	if err != nil {
 		return nil, fmt.Errorf("readElement: error when reading VL for element %v: %w", t, err)
 	}
 	debug.Logf("readElement: vl: %d", vl)
 
-	val, err := r.readValue(*t, vr, vl, readImplicit, d, fc)
+	val, err := r.readValue(*t, resolvedVR, vl, readImplicit, d, fc)
 	if err != nil {
 		return nil, fmt.Errorf("readElement: error when reading value for element %v: %w", t, err)
 	}
 
-	return &Element{Tag: *t, ValueRepresentation: tag.GetVRKind(*t, vr), RawValueRepresentation: vr, ValueLength: vl, Value: val}, nil
+	// A Private Creator element binds its block in the current dataset/item
+	// scope for subsequent private data elements.
+	r.bindPrivateCreator(*t, resolvedVR, val)
+
+	return &Element{Tag: *t, Name: privateName, ValueRepresentation: tag.GetVRKind(*t, resolvedVR), RawValueRepresentation: resolvedVR, ValueLength: vl, Value: val}, nil
 }
 
 // Read an Item object as raw bytes, useful when parsing encapsulated PixelData.
