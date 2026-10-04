@@ -70,6 +70,38 @@ You can also built it using Go directly:
 go build -o dicomutil ./cmd/dicomutil
 ```
 
+## Private Data Elements
+
+The same private tag can mean different things on different equipment, so it
+is never looked up by its `uint32` tag alone. A caller-supplied private
+dictionary keys entries by the Private Creator string, the odd group number,
+and the element number within the private block:
+
+```go
+import "github.com/suyashkumar/dicom/pkg/private"
+
+dict := private.NewDictionary(map[private.Key]private.Definition{
+    {Creator: "ACME CORP", Group: 0x0009, Offset: 0x10}: {VR: "US", Keyword: "AcmeThing"},
+})
+ds, err := dicom.ParseUntilEOF(f, nil, dicom.WithPrivateDictionary(dict))
+```
+
+Private Creator slots are tracked separately for the dataset and each
+sequence item; child items do not inherit their parent's slots, and different
+items may bind the same slot to different creators. Creator padding
+(trailing spaces/NULs) is normalized.
+
+* Under Implicit VR the dictionary selects the VR for matching elements.
+* Under Explicit VR the on-wire VR is retained; if it disagrees with the
+  dictionary, a diagnostic is recorded (`Parser.PrivateVRConflicts()`). Pass
+  `dicom.RejectOnPrivateVRConflict()` to reject such elements instead.
+* Elements whose block has no creator reservation, or whose creator is not in
+  the dictionary, are kept as raw bytes (`UN`) without fabricated names or
+  value types.
+
+The dictionary affects interpretation only; writing a parsed dataset back out
+preserves the original private tag numbers.
+
 ## History
 Here's a little more history on this repository for those who are interested! 
 

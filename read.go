@@ -16,6 +16,7 @@ import (
 
 	"github.com/suyashkumar/dicom/pkg/dicomio"
 	"github.com/suyashkumar/dicom/pkg/frame"
+	"github.com/suyashkumar/dicom/pkg/private"
 	"github.com/suyashkumar/dicom/pkg/tag"
 	"golang.org/x/exp/constraints"
 )
@@ -44,6 +45,17 @@ var (
 type reader struct {
 	rawReader *dicomio.Reader
 	opts      parseOptSet
+
+	// privateDict is the caller-supplied private dictionary, if any.
+	privateDict *private.Dictionary
+	// privateScope tracks Private Creator reservations for the dataset
+	// currently being parsed. Each sequence item maintains its own scope (see
+	// readSequenceItem); this scope is only for the top-level dataset (and the
+	// metadata, where private elements do not occur).
+	privateScope *private.Scope
+	// privateConflicts collects explicit on-wire VR vs. private-dictionary VR
+	// disagreements encountered while parsing.
+	privateConflicts []*PrivateVRConflict
 }
 
 func (r *reader) readTag() (*tag.Tag, error) {
@@ -58,8 +70,13 @@ func (r *reader) readTag() (*tag.Tag, error) {
 }
 
 // TODO: Parsed VR should be an enum. Will require refactors of tag pkg.
-func (r *reader) readVR(isImplicit bool, t tag.Tag) (string, error) {
+func (r *reader) readVR(isImplicit bool, t tag.Tag, scope *private.Scope) (string, error) {
 	if isImplicit {
+		// Private Creator reservation elements are always LO, even though
+		// they are not in the standard tag dictionary.
+		if private.IsCreator(t) {
+			return vrraw.LongString, nil
+		}
 		if entry, err := tag.Find(t); err == nil {
 			switch entry.Tag {
 			case tag.PixelData, tag.OverlayData:
@@ -71,12 +88,52 @@ func (r *reader) readVR(isImplicit bool, t tag.Tag) (string, error) {
 				return entry.VRs[0], nil
 			}
 		}
+		// Not a standard tag: resolve via the caller-supplied private
+		// dictionary, scoped to the Private Creator reservations in effect for
+		// this dataset/item. Unknown creators stay as raw bytes (VR=UN); we do
+		// not invent a field name or value type.
+		if def, _, ok := scope.Lookup(t); ok {
+			return def.VR, nil
+		}
 		return tag.UnknownVR, nil
 	}
 
 	// Explicit Transfer Syntax, read 2 byte VR:
-	return r.rawReader.ReadString(2)
+	wireVR, err := r.rawReader.ReadString(2)
+	if err != nil {
+		return "", err
+	}
 
+	// If the on-wire VR disagrees with the caller's private dictionary, emit a
+	// diagnostic and either reject or keep the on-wire VR depending on
+	// configuration.
+	if def, _, ok := scope.Lookup(t); ok && def.VR != wireVR {
+		conflict := &PrivateVRConflict{
+			Tag:           t,
+			WireVR:        wireVR,
+			DictionaryVR:  def.VR,
+			DictionaryKey: r.privateKeyFor(t, scope),
+		}
+		r.privateConflicts = append(r.privateConflicts, conflict)
+		log.Printf("dicom: private element %v: on-wire VR %s conflicts with private dictionary VR %s; using on-wire VR",
+			t, wireVR, def.VR)
+		if r.opts.rejectOnPrivateVRConflict {
+			return "", conflict
+		}
+	}
+
+	return wireVR, nil
+}
+
+// privateKeyFor returns the private dictionary key that resolved the given
+// tag within scope, if any. Used for conflict diagnostics.
+func (r *reader) privateKeyFor(t tag.Tag, scope *private.Scope) private.Key {
+	_, offset, err := private.Parts(t)
+	if err != nil {
+		return private.Key{}
+	}
+	creator, _ := scope.ResolveCreator(t)
+	return private.Key{Creator: creator, Group: t.Group, Offset: offset}
 }
 
 func (r *reader) readVL(isImplicit bool, t tag.Tag, vr string) (uint32, error) {
@@ -119,7 +176,7 @@ func (r *reader) readVL(isImplicit bool, t tag.Tag, vr string) (uint32, error) {
 	}
 }
 
-func (r *reader) readValue(t tag.Tag, vr string, vl uint32, isImplicit bool, d *Dataset, fc chan<- *frame.Frame) (Value, error) {
+func (r *reader) readValue(t tag.Tag, vr string, vl uint32, isImplicit bool, d *Dataset, fc chan<- *frame.Frame, scope *private.Scope) (Value, error) {
 	vrkind := tag.GetVRKind(t, vr)
 	// TODO: if we keep consistent function signature, consider a static map of VR to func?
 	switch vrkind {
@@ -135,7 +192,7 @@ func (r *reader) readValue(t tag.Tag, vr string, vl uint32, isImplicit bool, d *
 	case tag.VRUInt16List, tag.VRUInt32List, tag.VRInt16List, tag.VRInt32List, tag.VRTagList:
 		return r.readInt(t, vr, vl)
 	case tag.VRSequence:
-		return r.readSequence(t, vr, vl, d)
+		return r.readSequence(t, vr, vl, d, scope)
 	case tag.VRItem:
 		return r.readSequenceItem(t, vr, vl, d)
 	case tag.VRPixelData:
@@ -151,7 +208,7 @@ func (r *reader) readValue(t tag.Tag, vr string, vl uint32, isImplicit bool, d *
 	// correctly.
 	case tag.VRUnknown:
 		if vl == tag.VLUndefinedLength {
-			return r.readSequence(t, vr, vl, d)
+			return r.readSequence(t, vr, vl, d, scope)
 		}
 		return r.readBytes(t, vr, vl)
 	default:
@@ -211,7 +268,7 @@ func (r *reader) readHeader() ([]*Element, error) {
 
 	// Must read metadata as LittleEndian explicit VR
 	// Read the length of the metadata elements: (0002,0000) MetaElementGroupLength
-	maybeMetaLen, err := r.readElement(nil, nil)
+	maybeMetaLen, err := r.readElement(nil, nil, r.privateScope)
 	if err != nil {
 		return nil, fmt.Errorf("error reading DICOM header element: %w", err)
 	}
@@ -236,7 +293,7 @@ func (r *reader) readHeader() ([]*Element, error) {
 		}
 		defer r.rawReader.PopLimit()
 		for !r.rawReader.IsLimitExhausted() {
-			elem, err := r.readElement(nil, nil)
+			elem, err := r.readElement(nil, nil, r.privateScope)
 			if err != nil {
 				// TODO: see if we can skip over malformed elements somehow
 				return nil, fmt.Errorf("error reading DICOM header element: %w", err)
@@ -262,7 +319,7 @@ func (r *reader) readHeader() ([]*Element, error) {
 			if group != 0x0002 {
 				break
 			}
-			elem, err := r.readElement(nil, nil)
+			elem, err := r.readElement(nil, nil, r.privateScope)
 			if err != nil {
 				// TODO: see if we can skip over malformed elements somehow
 				return nil, fmt.Errorf("error reading DICOM header element (with no meta element group length defined): %w", err)
@@ -583,13 +640,13 @@ func readNativeFrame[I constraints.Integer](bitsAllocated, rows, cols, bytesToRe
 // readSequence reads a sequence element (VR = SQ) that contains a subset of Items. Each item contains
 // a set of Elements.
 // See https://dicom.nema.org/medical/dicom/current/output/chtml/part05/sect_7.5.2.html#table_7.5-1
-func (r *reader) readSequence(t tag.Tag, vr string, vl uint32, d *Dataset) (Value, error) {
+func (r *reader) readSequence(t tag.Tag, vr string, vl uint32, d *Dataset, scope *private.Scope) (Value, error) {
 	var sequences sequencesValue
 
 	seqElements := &Dataset{}
 	if vl == tag.VLUndefinedLength {
 		for {
-			subElement, err := r.readElement(seqElements, nil)
+			subElement, err := r.readElement(seqElements, nil, scope)
 			if err != nil {
 				// Stop reading due to error
 				return nil, fmt.Errorf("readSequence: error reading subitem in a sequence: %w", err)
@@ -615,7 +672,7 @@ func (r *reader) readSequence(t tag.Tag, vr string, vl uint32, d *Dataset) (Valu
 			return nil, err
 		}
 		for !r.rawReader.IsLimitExhausted() {
-			subElement, err := r.readElement(seqElements, nil)
+			subElement, err := r.readElement(seqElements, nil, scope)
 			if err != nil {
 				// TODO: option to ignore errors parsing subelements?
 				return nil, fmt.Errorf("readSequence: error reading subitem in a sequence: %w", err)
@@ -638,10 +695,13 @@ func (r *reader) readSequenceItem(t tag.Tag, vr string, vl uint32, d *Dataset) (
 	// seqElements holds items read so far.
 	// TODO: deduplicate with sequenceItem above
 	seqElements := Dataset{}
+	// Private Creator reservations are local to each sequence item. A child
+	// item does not inherit its parent item's reservations.
+	itemScope := private.NewScope(r.privateDict)
 
 	if vl == tag.VLUndefinedLength {
 		for {
-			subElem, err := r.readElement(&seqElements, nil)
+			subElem, err := r.readElement(&seqElements, nil, itemScope)
 			if err != nil {
 				return nil, fmt.Errorf("readSequenceItem: error reading subitem in a sequence item: %w", err)
 			}
@@ -659,7 +719,7 @@ func (r *reader) readSequenceItem(t tag.Tag, vr string, vl uint32, d *Dataset) (
 		}
 
 		for !r.rawReader.IsLimitExhausted() {
-			subElem, err := r.readElement(&seqElements, nil)
+			subElem, err := r.readElement(&seqElements, nil, itemScope)
 			if err != nil {
 				return nil, fmt.Errorf("readSequenceItem: error reading subitem in a sequence item: %w", err)
 			}
@@ -831,7 +891,7 @@ func (r *reader) readInt(t tag.Tag, vr string, vl uint32) (Value, error) {
 // elements read so far, since previously read elements may be needed to parse
 // certain Elements (like native PixelData). If the Dataset is nil, it is
 // treated as an empty Dataset.
-func (r *reader) readElement(d *Dataset, fc chan<- *frame.Frame) (*Element, error) {
+func (r *reader) readElement(d *Dataset, fc chan<- *frame.Frame, scope *private.Scope) (*Element, error) {
 	t, err := r.readTag()
 	if err != nil {
 		return nil, fmt.Errorf("readElement: error when reading element tag: %w", err)
@@ -844,7 +904,7 @@ func (r *reader) readElement(d *Dataset, fc chan<- *frame.Frame) (*Element, erro
 		readImplicit = true
 	}
 
-	vr, err := r.readVR(readImplicit, *t)
+	vr, err := r.readVR(readImplicit, *t, scope)
 	if err != nil {
 		return nil, fmt.Errorf("readElement: error when reading VR for element %v: %w", t, err)
 	}
@@ -856,9 +916,18 @@ func (r *reader) readElement(d *Dataset, fc chan<- *frame.Frame) (*Element, erro
 	}
 	debug.Logf("readElement: vl: %d", vl)
 
-	val, err := r.readValue(*t, vr, vl, readImplicit, d, fc)
+	val, err := r.readValue(*t, vr, vl, readImplicit, d, fc, scope)
 	if err != nil {
 		return nil, fmt.Errorf("readElement: error when reading value for element %v: %w", t, err)
+	}
+
+	// A Private Creator reservation element binds its block within the
+	// current scope so later private data elements can resolve. Creator value
+	// padding is normalized for stable, deterministic binding.
+	if private.IsCreator(*t) && val != nil && val.ValueType() == Strings {
+		if strs := MustGetStrings(val); len(strs) > 0 {
+			scope.SetCreator(byte(t.Element), strs[0])
+		}
 	}
 
 	return &Element{Tag: *t, ValueRepresentation: tag.GetVRKind(*t, vr), RawValueRepresentation: vr, ValueLength: vl, Value: val}, nil
@@ -873,7 +942,7 @@ func (r *reader) readRawItem(shouldSkip bool) ([]byte, bool, error) {
 		return nil, true, fmt.Errorf("readRawItem: error when reading item tag: %w", err)
 	}
 	// Item is always encoded implicit. PS3.6 7.5
-	vr, err := r.readVR(true, *t)
+	vr, err := r.readVR(true, *t, nil)
 	if err != nil {
 		return nil, true, fmt.Errorf("readRawItem: error when reading VR for item %v: %w", t, err)
 	}
