@@ -82,12 +82,15 @@ func parseInternal(in io.Reader, bytesToRead int64, frameChan chan *frame.Frame,
 				break
 			}
 
-			// exit on error
+			// Exit on error. Note: unlike io.EOF above, io.ErrUnexpectedEOF
+			// (e.g. truncated PixelData) is intentionally surfaced to the caller.
 			return p.dataset, err
 		}
 	}
 
-	// Close the frameChannel if needed
+	// Close the frameChannel if needed. This is the documented behavior of the
+	// legacy Parse/ParseFile API. The newer context-aware streaming APIs only
+	// close resources they create and own themselves.
 	if p.frameChannel != nil {
 		close(p.frameChannel)
 	}
@@ -121,6 +124,9 @@ type Parser struct {
 	// file is optional, might be populated if reading from an underlying file
 	file         *os.File
 	frameChannel chan *frame.Frame
+	// emitter receives parsed frames. If frameChannel is set, it wraps that
+	// caller-owned channel; streaming APIs set their own owned emitter.
+	emitter frameEmitter
 }
 
 // NewParser returns a new Parser that points to the provided io.Reader, with bytesToRead bytes left to read. NewParser
@@ -129,13 +135,30 @@ type Parser struct {
 // frameChannel is an optional channel (can be nil) upon which DICOM image frames will be sent as they are parsed (if
 // provided).
 func NewParser(in io.Reader, bytesToRead int64, frameChannel chan *frame.Frame, opts ...ParseOption) (*Parser, error) {
+	var emitter frameEmitter
+	if frameChannel != nil {
+		emitter = &channelFrameEmitter{ch: frameChannel}
+	}
+	return newParserInternal(in, bytesToRead, frameChannel, emitter, opts...)
+}
+
+// newParserInternal creates a Parser with an explicit frame emitter used by
+// the context-aware streaming APIs. The frameChannel argument is retained for
+// legacy behavior (it is closed by the legacy Parse entry points); the emitter
+// is what actually receives frames during parsing.
+func newParserInternal(in io.Reader, bytesToRead int64, frameChannel chan *frame.Frame, emitter frameEmitter, opts ...ParseOption) (*Parser, error) {
 	optSet := toParseOptSet(opts...)
+	bufferedIn := bufio.NewReader(in)
+	if optSet.readBufferSize > 0 {
+		bufferedIn = bufio.NewReaderSize(in, optSet.readBufferSize)
+	}
 	p := Parser{
 		reader: &reader{
-			rawReader: dicomio.NewReader(bufio.NewReader(in), binary.LittleEndian, bytesToRead),
+			rawReader: dicomio.NewReader(bufferedIn, binary.LittleEndian, bytesToRead),
 			opts:      optSet,
 		},
 		frameChannel: frameChannel,
+		emitter:      emitter,
 	}
 
 	elems := []*Element{}
@@ -241,7 +264,7 @@ func (p *Parser) Next() (*Element, error) {
 		}
 		return nil, ErrorEndOfDICOM
 	}
-	elem, err := p.reader.readElement(&p.dataset, p.frameChannel)
+	elem, err := p.reader.readElement(&p.dataset, p.emitter)
 	if err != nil {
 		// TODO: tolerate some kinds of errors and continue parsing
 		return nil, err
@@ -284,6 +307,10 @@ type parseOptSet struct {
 	skipProcessingPixelDataValue       bool
 	allowMissingMetaElementGroupLength bool
 	allowUnknownSpecificCharacterSet   bool
+	// readBufferSize, when > 0, sets the size of the internal buffered reader.
+	// Currently only exercised by tests that need byte-level synchronization
+	// with the underlying reader. Zero keeps the bufio.NewReader default.
+	readBufferSize int
 }
 
 func toParseOptSet(opts ...ParseOption) parseOptSet {
@@ -354,5 +381,13 @@ func SkipPixelData() ParseOption {
 func SkipProcessingPixelDataValue() ParseOption {
 	return func(set *parseOptSet) {
 		set.skipProcessingPixelDataValue = true
+	}
+}
+
+// withReadBufferSize sets the size of the internal buffered reader. It is used
+// by tests that need byte-level synchronization with the underlying reader.
+func withReadBufferSize(n int) ParseOption {
+	return func(set *parseOptSet) {
+		set.readBufferSize = n
 	}
 }
