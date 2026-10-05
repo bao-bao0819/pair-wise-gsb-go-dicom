@@ -2,6 +2,7 @@ package dicom
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -44,6 +45,36 @@ var (
 type reader struct {
 	rawReader *dicomio.Reader
 	opts      parseOptSet
+	// sink receives decoded frames for the context-aware streaming APIs. When
+	// nil, frames are delivered through the legacy frame channel argument.
+	sink func(*frame.Frame) error
+	// ctx points at the live parse context checked at cancellation points and
+	// forwarded to a caller-provided ContextReader. It is updated to the
+	// derived (cancellable) context for streaming APIs; legacy APIs leave it as
+	// context.Background.
+	ctx *context.Context
+}
+
+// emitFrame delivers a decoded frame. When a streaming sink is configured the
+// frame goes to the sink (which honors back-pressure and cancellation) and the
+// legacy channel is ignored. Otherwise it is sent on the legacy channel.
+func (r *reader) emitFrame(f *frame.Frame, fc chan<- *frame.Frame) error {
+	if r.sink != nil {
+		return r.sink(f)
+	}
+	if fc != nil {
+		fc <- f
+	}
+	return nil
+}
+
+// checkContext returns the context's error once it is cancelled. It is a no-op
+// for the legacy (non-streaming) APIs whose context is never cancelled.
+func (r *reader) checkContext() error {
+	if r.ctx == nil || *r.ctx == nil {
+		return nil
+	}
+	return (*r.ctx).Err()
 }
 
 func (r *reader) readTag() (*tag.Tag, error) {
@@ -285,28 +316,41 @@ func (r *reader) readPixelData(vl uint32, d *Dataset, fc chan<- *frame.Frame) (V
 			return nil, fmt.Errorf("readPixelData: error skipping basic offset table: %w", err)
 		}
 
-		for !r.rawReader.IsLimitExhausted() {
+		// Note: we intentionally do not gate this loop on IsLimitExhausted().
+		// An encapsulated PixelData is terminated by an explicit Sequence
+		// Delimitation Item; reaching the limit/EOF while expecting another item
+		// is truncation and must surface as an error, not silently look like a
+		// complete read.
+		for {
+			if err := r.checkContext(); err != nil {
+				return nil, err
+			}
 			data, endOfItems, err := r.readRawItem(r.opts.skipPixelData /*shouldSkip*/)
 			if err != nil {
-				break
+				if errors.Is(err, io.EOF) {
+					err = fmt.Errorf("readPixelData: encapsulated PixelData ended without a Sequence Delimitation Item: %w", io.ErrUnexpectedEOF)
+				}
+				return nil, fmt.Errorf("readPixelData: error reading encapsulated frame: %w", err)
 			}
 
 			if endOfItems {
 				break
 			}
 
-			f := frame.Frame{
+			f := &frame.Frame{
 				Encapsulated: true,
 				EncapsulatedData: frame.EncapsulatedFrame{
 					Data: data,
 				},
 			}
 
-			if fc != nil {
-				fc <- &f
+			if err := r.emitFrame(f, fc); err != nil {
+				return nil, err
 			}
 
-			image.Frames = append(image.Frames, &f)
+			if r.sink == nil {
+				image.Frames = append(image.Frames, f)
+			}
 		}
 		image.IntentionallySkipped = r.opts.skipPixelData
 		return &pixelDataValue{PixelDataInfo: image}, nil
@@ -388,25 +432,27 @@ func fillBufferSingleBitAllocated(pixelData []int, d *dicomio.Reader, bo binary.
 	return nil
 }
 
-func makeErrorPixelData(reader io.Reader, vl uint32, fc chan<- *frame.Frame, parseErr error) (*PixelDataInfo, error) {
+func makeErrorPixelData(r *reader, reader io.Reader, vl uint32, fc chan<- *frame.Frame, parseErr error) (*PixelDataInfo, error) {
 	data := make([]byte, vl)
 	_, err := io.ReadFull(reader, data)
 	if err != nil {
 		return nil, fmt.Errorf("makeErrorPixelData: read pixelData: %w", err)
 	}
 
-	f := frame.Frame{
+	f := &frame.Frame{
 		EncapsulatedData: frame.EncapsulatedFrame{
 			Data: data,
 		},
 	}
 
-	if fc != nil {
-		fc <- &f
+	if emitErr := r.emitFrame(f, fc); emitErr != nil {
+		return nil, emitErr
 	}
 	image := PixelDataInfo{
 		ParseErr: parseErr,
-		Frames:   []*frame.Frame{&f},
+	}
+	if r.sink == nil {
+		image.Frames = []*frame.Frame{f}
 	}
 	return &image, nil
 }
@@ -473,7 +519,7 @@ func (r *reader) readNativeFrames(parsedData *Dataset, fc chan<- *frame.Frame, v
 			if !r.opts.allowMismatchPixelDataLength {
 				return nil, 0, fmt.Errorf("error when reading Native PixelData: expected_vl=%d actual_vl=%d %w", bytesToRead, vl, ErrorMismatchPixelDataLength)
 			}
-			image, err := makeErrorPixelData(r.rawReader, vl, fc, ErrorMismatchPixelDataLength)
+			image, err := makeErrorPixelData(r, r.rawReader, vl, fc, ErrorMismatchPixelDataLength)
 			if err != nil {
 				return nil, 0, fmt.Errorf("readNativeFrames: error making error pixel data: %w", err)
 			}
@@ -485,10 +531,15 @@ func (r *reader) readNativeFrames(parsedData *Dataset, fc chan<- *frame.Frame, v
 	image := PixelDataInfo{
 		IsEncapsulated: false,
 	}
-	image.Frames = make([]*frame.Frame, nFrames)
+	if r.sink == nil {
+		image.Frames = make([]*frame.Frame, nFrames)
+	}
 	bo := r.rawReader.ByteOrder()
 	pixelBuf := make([]byte, bytesAllocated)
 	for frameIdx := 0; frameIdx < nFrames; frameIdx++ {
+		if err := r.checkContext(); err != nil {
+			return nil, bytesToRead, err
+		}
 		// Init current frame
 		currentFrame := frame.Frame{
 			Encapsulated: false,
@@ -521,9 +572,11 @@ func (r *reader) readNativeFrames(parsedData *Dataset, fc chan<- *frame.Frame, v
 		if err != nil {
 			return nil, bytesToRead, err
 		}
-		image.Frames[frameIdx] = &currentFrame
-		if fc != nil {
-			fc <- &currentFrame // write the current frame to the frame channel
+		if r.sink == nil {
+			image.Frames[frameIdx] = &currentFrame
+		}
+		if err := r.emitFrame(&currentFrame, fc); err != nil {
+			return nil, bytesToRead, err
 		}
 	}
 	if skipFinalPaddingByte {
@@ -550,6 +603,11 @@ func readNativeFrame[I constraints.Integer](bitsAllocated, rows, cols, bytesToRe
 		for value := 0; value < samplesPerPixel; value++ {
 			_, err := io.ReadFull(rawReader, pixelBuf)
 			if err != nil {
+				if errors.Is(err, io.EOF) {
+					// A declared Native PixelData frame ended before all of its
+					// pixels were read: this is truncation, not a clean EOF.
+					err = fmt.Errorf("truncated native pixel data: %w", io.ErrUnexpectedEOF)
+				}
 				return frame.Frame{}, bytesToRead,
 					fmt.Errorf("could not read uint%d from input: %w", bitsAllocated, err)
 			}
@@ -589,6 +647,9 @@ func (r *reader) readSequence(t tag.Tag, vr string, vl uint32, d *Dataset) (Valu
 	seqElements := &Dataset{}
 	if vl == tag.VLUndefinedLength {
 		for {
+			if err := r.checkContext(); err != nil {
+				return nil, err
+			}
 			subElement, err := r.readElement(seqElements, nil)
 			if err != nil {
 				// Stop reading due to error
@@ -615,6 +676,11 @@ func (r *reader) readSequence(t tag.Tag, vr string, vl uint32, d *Dataset) (Valu
 			return nil, err
 		}
 		for !r.rawReader.IsLimitExhausted() {
+			if err := r.checkContext(); err != nil {
+				// Do not PopLimit on cancellation: that would Skip (read) the
+				// remainder of the sequence and could block.
+				return nil, err
+			}
 			subElement, err := r.readElement(seqElements, nil)
 			if err != nil {
 				// TODO: option to ignore errors parsing subelements?
@@ -641,6 +707,9 @@ func (r *reader) readSequenceItem(t tag.Tag, vr string, vl uint32, d *Dataset) (
 
 	if vl == tag.VLUndefinedLength {
 		for {
+			if err := r.checkContext(); err != nil {
+				return nil, err
+			}
 			subElem, err := r.readElement(&seqElements, nil)
 			if err != nil {
 				return nil, fmt.Errorf("readSequenceItem: error reading subitem in a sequence item: %w", err)
@@ -659,6 +728,11 @@ func (r *reader) readSequenceItem(t tag.Tag, vr string, vl uint32, d *Dataset) (
 		}
 
 		for !r.rawReader.IsLimitExhausted() {
+			if err := r.checkContext(); err != nil {
+				// Do not PopLimit on cancellation (it would read/skip the
+				// remainder and could block).
+				return nil, err
+			}
 			subElem, err := r.readElement(&seqElements, nil)
 			if err != nil {
 				return nil, fmt.Errorf("readSequenceItem: error reading subitem in a sequence item: %w", err)

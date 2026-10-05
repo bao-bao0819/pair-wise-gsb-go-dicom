@@ -23,6 +23,7 @@ package dicom
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -130,10 +131,28 @@ type Parser struct {
 // provided).
 func NewParser(in io.Reader, bytesToRead int64, frameChannel chan *frame.Frame, opts ...ParseOption) (*Parser, error) {
 	optSet := toParseOptSet(opts...)
+
+	// Resolve the parse context. Streaming APIs install one (possibly derived
+	// from a cancellable parent); legacy APIs use context.Background.
+	parseCtx := optSet.parseCtx
+	if parseCtx == nil {
+		parseCtx = context.Background()
+	}
+	ctxHolder := parseCtx
+	ctxFn := func() context.Context { return ctxHolder }
+
+	// If the caller's reader implements dicomio.ContextReader, route underlying
+	// reads through ReadContext with the live parse context so blocking reads
+	// can be interrupted. A plain io.Reader is left untouched; context
+	// cancellation then only takes effect at parse checkpoints.
+	underlying := dicomio.MaybeCancellable(in, ctxFn)
+
 	p := Parser{
 		reader: &reader{
-			rawReader: dicomio.NewReader(bufio.NewReader(in), binary.LittleEndian, bytesToRead),
+			rawReader: dicomio.NewReader(bufio.NewReader(underlying), binary.LittleEndian, bytesToRead),
 			opts:      optSet,
+			sink:      optSet.frameSink,
+			ctx:       &ctxHolder,
 		},
 		frameChannel: frameChannel,
 	}
@@ -284,6 +303,15 @@ type parseOptSet struct {
 	skipProcessingPixelDataValue       bool
 	allowMissingMetaElementGroupLength bool
 	allowUnknownSpecificCharacterSet   bool
+
+	// frameSink, when set, receives each decoded pixel-data frame. It replaces
+	// the externally supplied frame channel for the context-aware streaming
+	// APIs. A non-nil error aborts parsing. Unexported; only the streaming
+	// entry points set it.
+	frameSink func(*frame.Frame) error
+	// parseCtx is checked at parse cancellation points and forwarded to a
+	// caller-provided dicomio.ContextReader during blocking reads.
+	parseCtx context.Context
 }
 
 func toParseOptSet(opts ...ParseOption) parseOptSet {
@@ -354,5 +382,21 @@ func SkipPixelData() ParseOption {
 func SkipProcessingPixelDataValue() ParseOption {
 	return func(set *parseOptSet) {
 		set.skipProcessingPixelDataValue = true
+	}
+}
+
+// withFrameSink installs an internal frame sink used by the context-aware
+// streaming APIs. It is not intended for direct use by callers.
+func withFrameSink(sink func(*frame.Frame) error) ParseOption {
+	return func(set *parseOptSet) {
+		set.frameSink = sink
+	}
+}
+
+// withParseContext installs the parse context checked at cancellation points
+// and used for interruptible reads. It is internal to the streaming APIs.
+func withParseContext(ctx context.Context) ParseOption {
+	return func(set *parseOptSet) {
+		set.parseCtx = ctx
 	}
 }
