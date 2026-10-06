@@ -39,6 +39,29 @@ fmt.Println(j)
 ```
 More details about the package (and additional examples and APIs) can be found in the [godoc](https://godoc.org/github.com/suyashkumar/dicom).
 
+## Structural Validation
+
+Before writing a dataset you can produce a standalone, read-only structural check report with `Dataset.Validate` (or the package-level `dicom.ValidateDataset`). It compares each element against the data dictionary and the DICOM PS3.5 representation rules:
+
+- reports the concrete value representation (VR), in-memory value shape, and value multiplicity (VM) violations, covering fixed (`1`), interval (`1-3`, `1-n`), and multiple (`2-2n`) VM forms;
+- checks PS3.5 representation ranges for numeric VRs (US/SS/UL/SL), string lengths for character VRs (measured in characters after stripping insignificant trailing padding), and word-width alignment for binary VRs — binary values are a single octet stream and never have their VM derived from the byte length;
+- recurses into Sequence items and reports the full tag/item path, e.g. `(0008,1199)/item[1]/(0040,a043)/item[2]/(0008,0100)`;
+- returns findings it cannot prove as **undetermined** rather than as successes: unknown/non-standard tags, unknown private fields, opaque or context-dependent VRs (e.g. `UN`, or multi-VR tags such as OB/OW without a concrete VR), and unrecognized VM strings;
+- caps the number of aggregated findings (default `dicom.DefaultMaxIssues = 100`, configurable via `dicom.WithMaxIssues`; `<= 0` means unlimited) and sets `Report.Truncated` when findings were dropped.
+
+```go
+report := dataset.Validate() // or dicom.ValidateDataset(&dataset, dicom.WithMaxIssues(200))
+if !report.Valid() {
+    // report.Errors() are definite structural violations;
+    // report.Undetermined() could not be judged from available evidence.
+    for _, issue := range report.Issues {
+        fmt.Println(issue)
+    }
+}
+```
+
+Validation never modifies the dataset (no values are repaired or re-encoded). It verifies file structure only: it does not assert any Information Object Definition (IOD), Type 1/Type 2 presence, or medical/diagnostic compliance.
+
 ## CLI Tool
 A CLI tool that uses this package to parse imagery and metadata out of DICOMs is provided in the `cmd/dicomutil` package. This tool can take in a DICOM, and dump out all the elements to STDOUT, in addition to writing out any imagery to the current working directory either as PNGs or JPEG (note, it does not perform any automatic color rescaling by default).
 
